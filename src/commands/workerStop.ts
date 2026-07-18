@@ -1,4 +1,4 @@
-// src/commands/workerStop.ts — SIGTERM all running workers, wait for stopped status
+// src/commands/workerStop.ts — Signal workers via DB (cross-platform) and wait for stopped status
 import { prisma } from "../db";
 
 const STOP_TIMEOUT_MS = 20_000;
@@ -14,30 +14,29 @@ export async function workerStop(): Promise<void> {
     return;
   }
 
-  console.log(`Sending SIGTERM to ${workers.length} running worker(s)...`);
+  console.log(`Sending shutdown signal to ${workers.length} running worker(s)...`);
 
   const signalled: string[] = [];
 
   for (const worker of workers) {
     try {
-      process.kill(worker.pid, "SIGTERM");
-
+      // Set status to 'stopping' — the worker's heartbeat loop detects this via the DB
+      // and initiates a graceful shutdown. This is cross-platform (no OS signals needed).
       await prisma.worker.update({
         where: { id: worker.id },
         data: { status: "stopping" },
       });
-
       signalled.push(worker.id);
-      console.log(`  → SIGTERM sent to ${worker.id} (PID: ${worker.pid})`);
+      console.log(`  → Shutdown signal sent to ${worker.id} (PID: ${worker.pid})`);
     } catch (err) {
-      // Process no longer exists — mark stopped immediately
+      // Row may already be gone — mark stopped
       console.warn(
         `  ⚠ Could not signal ${worker.id} (PID: ${worker.pid}): ${String(err)}`
       );
       await prisma.worker.update({
         where: { id: worker.id },
         data: { status: "stopped" },
-      });
+      }).catch(() => {/* already gone */});
     }
   }
 

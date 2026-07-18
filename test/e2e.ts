@@ -100,8 +100,9 @@ async function spawnWorker(): Promise<WorkerHandle> {
 }
 
 /**
- * Gracefully stop a worker by sending SIGTERM and waiting for its exit event.
- * Times out after 10 s (should be plenty for any in-flight job to finish).
+ * Gracefully stop a worker by sending an IPC { type: 'shutdown' } message and
+ * waiting for its exit event. Works cross-platform (no OS signals needed).
+ * Times out after 10 s as a safety net.
  */
 async function stopWorker(handle: WorkerHandle): Promise<void> {
   return new Promise((resolve) => {
@@ -112,14 +113,32 @@ async function stopWorker(handle: WorkerHandle): Promise<void> {
       resolve();
     });
 
-    try {
-      process.kill(handle.pid, "SIGTERM");
-    } catch {
-      clearTimeout(timer);
-      resolve(); // already dead
+    // Use IPC instead of SIGTERM — works reliably on Windows
+    if (handle.child.connected) {
+      handle.child.send({ type: "shutdown" }, (err) => {
+        if (err) {
+          // IPC send failed — fall back to SIGTERM
+          console.warn(`[stopWorker] IPC send failed, falling back to SIGTERM:`, err);
+          try {
+            process.kill(handle.pid, "SIGTERM");
+          } catch {
+            clearTimeout(timer);
+            resolve(); // already dead
+          }
+        }
+      });
+    } else {
+      // No IPC channel (e.g. already disconnected) — fall back to SIGTERM
+      try {
+        process.kill(handle.pid, "SIGTERM");
+      } catch {
+        clearTimeout(timer);
+        resolve(); // already dead
+      }
     }
   });
 }
+
 
 /** Hard-kill a worker (SIGKILL) — simulates a crash, no graceful shutdown. */
 function killWorker(handle: WorkerHandle): void {

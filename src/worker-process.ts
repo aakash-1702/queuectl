@@ -8,6 +8,7 @@ process.on("uncaughtException", (err) => {
 });
 process.on("unhandledRejection", (err) => {
   console.error(`[worker] unhandledRejection:`, err);
+  process.exit(1);
 });
 
 import "dotenv/config";
@@ -147,17 +148,27 @@ async function poll(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat: keep Worker.updatedAt fresh so status command can detect staleness
+// Heartbeat: keep Worker.updatedAt fresh and check for DB-based stop signal
 // ---------------------------------------------------------------------------
 async function heartbeat(): Promise<void> {
   while (!shuttingDown) {
     await sleep(HEARTBEAT_INTERVAL_MS);
     if (shuttingDown) break;
     try {
-      await prisma.worker.update({
+      const row = await prisma.worker.update({
         where: { id: WORKER_ID },
         data: { status: "running" }, // triggers @updatedAt
       });
+      // CLI workerStop sets status='stopping' in the DB as a cross-platform
+      // shutdown signal (IPC is unavailable there since the parent process has exited)
+      if (row.status === "stopping") {
+        console.log(`[${WORKER_ID}] Detected status=stopping in DB — initiating graceful shutdown.`);
+        shutdown().catch((err) => {
+          console.error(`[${WORKER_ID}] shutdown() error (DB signal):`, err);
+          process.exit(1);
+        });
+        break;
+      }
     } catch {
       // Worker row may not exist yet (race at startup) — harmless
     }
@@ -183,17 +194,20 @@ async function shutdown(): Promise<void> {
   }
 
   // Mark this worker stopped in the DB
+  // Note: prisma.$disconnect() is intentionally omitted — process.exit(0) cleans
+  // up OS-level connections. Calling $disconnect() here was throwing and preventing
+  // process.exit(0) from being reached.
   try {
     await prisma.worker.update({
       where: { id: WORKER_ID },
       data: { status: "stopped" },
     });
-  } catch {
-    // Worker row may not exist in standalone mode
+    console.log(`[${WORKER_ID}] Stopped gracefully (status=stopped written to DB).`);
+  } catch (updateErr) {
+    console.error(`[${WORKER_ID}] Warning: could not update Worker status to stopped:`, updateErr);
   }
 
-  await prisma.$disconnect();
-  console.log(`[${WORKER_ID}] Stopped gracefully.`);
+  console.log(`[${WORKER_ID}] Exiting with code 0.`);
   process.exit(0);
 }
 
@@ -207,8 +221,29 @@ function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
+// IPC-based shutdown: used by test/e2e.ts (parent process holds the ChildProcess
+// reference and sends { type: 'shutdown' } via fork()'s built-in IPC channel).
+process.on("message", (msg: unknown) => {
+  if (
+    typeof msg === "object" &&
+    msg !== null &&
+    (msg as { type?: string }).type === "shutdown"
+  ) {
+    console.log(`[${WORKER_ID}] IPC shutdown message received.`);
+    shutdown().catch((err) => {
+      console.error(`[${WORKER_ID}] shutdown() error (IPC):`, err);
+      process.exit(1);
+    });
+  }
+});
+
+// SIGTERM fallback: useful on Unix systems or if called directly outside fork().
 process.on("SIGTERM", () => {
-  void shutdown();
+  console.log(`[${WORKER_ID}] SIGTERM received (OS signal fallback).`);
+  shutdown().catch((err) => {
+    console.error(`[${WORKER_ID}] shutdown() error (SIGTERM):`, err);
+    process.exit(1);
+  });
 });
 
 console.log(`[${WORKER_ID}] Starting (PID ${process.pid})...`);
